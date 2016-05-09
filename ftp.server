@@ -1,0 +1,185 @@
+<?
+class ftpd {
+	private $clients = array();
+	private $server = "";
+	private $listen_address = "";
+	private $listen_port = 0;
+	private $min_pasv_port = 15000;
+	private $max_pasv_port = 16000;
+	private $eol = "\n";
+/* Show log on stdout */
+	private function log($msg) {
+		$output = date("d-M-Y H:i:s") . " - " . $msg;
+		echo $output . "\n";
+	}
+/* Display socket error and abort */
+	function socket_error($command = "") {
+		$this->errorcode    = socket_last_error($this->server);
+		$this->errormessage = socket_strerror($this->errorcode);
+		$this->log("[ ERROR ] on command " . $command . "() : " . $this->errorcode . " - " . $this->errormessage);
+		die();
+	}
+/* Get list of connections currently alive */
+	private function socketlist() {
+		$socketlist = array(
+			'server' => $this->server
+		);
+		reset($this->clients);
+		while (list($k,$c) = each($this->clients)) {
+			$socketlist[$k] = $c['conn'];
+		}
+		return($socketlist);
+	}
+/* Add new client once connected */
+	private function add_client($conn) {
+		$clientID = uniqid("client_");
+		socket_getpeername($conn, $ip, $port);
+		$this->clients[$clientID] = array(
+			'conn'		=> $conn,
+			'ip'		=> $ip,
+			'hostname'	=> gethostbyaddr($ip),
+			'port'		=> $port,
+			'id'		=> $clientID
+		);
+		return($this->clients[$clientID]);
+	}
+/* Get Client List */
+	private function get_client($clientID) {
+		reset($this->clients);
+		while (list($id,$c) = each($this->clients)) {
+			if ($c['conn'] == $clientID)	return($c);
+		}
+		return(false);
+	}
+/* Remove a connection with a client */
+	private function remove_client($clientID) {
+		reset($this->clients);
+		while (list($k,$c) = each($this->clients)) {
+			if ($c['conn'] == $clientID)	unset($this->clients[$k]);
+		}
+		return(true);
+	}
+/* Constructor */
+	function ftpd($listen_port = 21) {
+		$listen_address	= gethostbyname($_SERVER['HOSTNAME']);
+		/* Open socket */
+		if (! ($server = @socket_create(AF_INET, SOCK_STREAM, 0)))			$this->socket_error('socket_create');
+		else																$this->log("[ DONE ] socket_create");
+		/* reuse listening socket address */
+		if (! @socket_setopt($server, SOL_SOCKET, SO_REUSEADDR, 1))			$this->socket_error('socket_setopt');
+		else																$this->log("[ DONE ] socket_setopt");
+		/* set socket to non-blocking */
+		if (! @socket_set_nonblock($server))								$this->socket_error('socket_set_nonblock');
+		else																$this->log("[ DONE ] socket_set_nonblock");
+		/* bind socket with address and port */
+		if (! @socket_bind($server, $listen_address, $listen_port))			$this->socket_error('socket_bind');
+		else																$this->log("[ DONE ] socket_bind on " . $listen_address . ":" . $listen_port);
+		/* start listening */
+		if (! @socket_listen($server))										$this->socket_error('socket_listen');
+		else																$this->log("[ DONE ] socket_listen");
+		$this->server			= $server;
+		$this->listen_address	= $listen_address;
+		$this->listen_port		= $listen_port;
+		/* define list of connections */
+		/* Loop waiting connections */
+		while (true) {
+			$this->log("[ WAIT ] Accept incoming connections (" . count($this->clients) . " clients currently connected)");
+			$write = NULL;
+			$exeption = NULL;
+			/* Build list of active sockets */
+			$slist = $this->socketlist();
+			if (socket_select($slist, $write, $exeption, 1, 0) > 0) {
+				foreach($slist as $sock) {
+					if ($sock == $this->server) {
+						/* accept a connection on server */
+						$this->log("New connection");
+						if (! ($conn = socket_accept($this->server))) {
+							$this->socket_error('socket_accept');
+						} else {
+							$lastclient = $this->add_client($conn);
+							$this->log("Client " . $lastclient['hostname'] . " (" . $lastclient['ip'] . ":" . $lastclient['port'] . ") connected");
+							$this->write($lastclient['conn'], 220, "Welcome!");
+						}
+					} else {
+						$this->log("ANOTHER MESSAGE");
+						$this->read($sock);
+					}
+				}
+			}
+		}
+	}
+/* write data to socket connection */
+	function write($clientID, $id, $message) {
+		$connected_client = $this->get_client($clientID);
+		$this->log("[ WRITE to " . $connected_client['hostname'] . " ] Message: " . $id . " " . $message);
+		if (! (socket_write($clientID, $id . " " . $message . "\r\n")))	$this->socket_error('socket_write');
+	}
+/* receive data from socket connection */
+	function read($clientID) {
+		$connected_client = $this->get_client($clientID);
+		$this->log("[ READ from " . $connected_client['hostname'] . " ] Ready");
+		//$this->log("Client " . $connected_client['hostname'] . " (" . $connected_client['ip'] . ":" . $connected_client['port'] . ") ready to write");
+		if (($msg = @socket_read($clientID, 1024)) === false || $msg == '') {
+			if ($msg != '') $this->socket_error('socket_read');
+			$this->log("[ READ from " . $connected_client['hostname'] . " ] **** Message: " . $msg);
+			$this->remove_client($clientID);
+			$this->log("[ DISCONNECT ] " . $clientID);
+		} else {
+			$msg = trim($msg);
+			$this->log("[ READ from " . $connected_client['hostname'] . " ] Message: " . $msg);
+			list($cmd, $cmd_option) = explode(" ", $msg, 2);
+			if ($cmd == "USER") {
+				$this->Write($clientID, 331, "Password required for " . $cmd_option);
+			} elseif ($cmd == "PASS") {
+				$this->Write($clientID, 230, "Welcome!");
+			} elseif ($cmd == "PWD") {
+				$this->Write($clientID, 257, "/ is the current directory");
+			} elseif ($cmd == "TYPE") {
+				$this->eol = ($cmd_option == "A" ? "\r\n" : "\n");
+				$this->Write($clientID, 200, "TYPE set to " . $cmd_option);
+			} elseif ($cmd == "AUTH") {
+				$this->Write($clientID, 500, $msg . " handled but not understood");
+			} elseif ($cmd == "PASV") {		/* Passive mode */
+				while (true) {
+					$port = rand($this->min_pasv_port, $this->max_pasv_port);
+					if (! ($conn = @socket_create(AF_INET, SOCK_STREAM, 0)))	$this->socket_error('PASV.socket_create');
+					else														$this->log("[ DONE ] PASV.socket_create");
+					/* reuse listening socket address */
+					if (! @socket_setopt($conn, SOL_SOCKET, SO_REUSEADDR, 1))	$this->socket_error('PASV.socket_setopt');
+					else														$this->log("[ DONE ] PASV.socket_setopt");
+					/* set socket to non-blocking */
+					if (! @socket_set_nonblock($conn))							$this->socket_error('PASV.socket_set_nonblock');
+					else														$this->log("[ DONE ] PASV.socket_set_nonblock");
+					/* bind socket with address and port */
+					if (! @socket_bind($conn, $this->listen_address, $port))	$this->socket_error('PASV.socket_bind');
+					else														$this->log("[ DONE ] PASV.socket_bind on " . $this->listen_address . ":" . $port);
+					/* start listening */
+					if (! @socket_listen($conn))								$this->socket_error('PASV.socket_listen');
+					else														$this->log("[ DONE ] PASV.socket_listen");
+					
+//					$this->remove_client($clientID);
+					print_r($this->clients);
+					$this->clients[$connected_client['id']]['conn'] = $conn;
+					$this->clients[$connected_client['id']]['port'] = $port;
+					
+					$p1 = $port >>  8;
+					$p2 = $port & 0xff;
+					$tmp = str_replace(".", ",", $this->listen_address);
+					$this->Write($clientID, 227, "Entering Passive Mode (" . $tmp . "," . $p1 . "," . $p2 . ").");
+					print_r($this->clients);
+					break;
+				}
+			} elseif ($cmd == "LIST") {
+				$msg = sprintf("%-11s%-2s%-15s%-15s%-10s%-13sNOME.file.txt" . $this->eol, 'drwxrwxrwx', '1', 'stefano', 'stefano', '10', '0');
+				$this->Write($clientID, "", $msg);
+				$msg = sprintf("%-11s%-2s%-15s%-15s%-10s%-13sNOME_file.txt" . $this->eol, 'drwxrwxrwx', '1', 'stex', 'prova', '20', '20150101');
+				$this->Write($clientID, "", $msg);
+				$this->Write($clientID, 226, "Transfer complete");
+			} else {
+				$this->Write($clientID, 500, $msg . " unhandled");
+			}
+		}
+	}
+}
+$server = new Ftpd(2121);
+?>
